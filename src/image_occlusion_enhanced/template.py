@@ -40,12 +40,15 @@ from .config import *
 
 iocard_front = """\
 {{#%(src_img)s}}
-<div id="io-header">{{%(header)s}}</div>
-<div id="io-wrapper">
-  <div id="io-overlay">{{%(que)s}}</div>
-  <div id="io-original">{{%(src_img)s}}</div>
+<div class="notion-card card-image-occlusion">
+  <div class="title-header"><div class="title-label">{{%(title)s}}</div></div>
+  <div class="front-wrapper"><div class="question-content">{{%(header)s}}</div></div>
+  <div id="io-wrapper">
+    <div id="io-overlay">{{%(que)s}}</div>
+    <div id="io-original">{{%(src_img)s}}</div>
+  </div>
+  {{#%(footer)s}}<div id="io-footer">{{%(footer)s}}</div>{{/%(footer)s}}
 </div>
-<div id="io-footer">{{%(footer)s}}</div>
 
 <script>
 // Prevent original image from loading before mask
@@ -67,6 +70,7 @@ if (mask === null || mask.complete) {
     "ans": IO_FLDS["am"],
     "svg": IO_FLDS["om"],
     "src_img": IO_FLDS["im"],
+    "title": IO_FLDS["tl"],
     "header": IO_FLDS["hd"],
     "footer": IO_FLDS["ft"],
     "remarks": IO_FLDS["rk"],
@@ -77,15 +81,17 @@ if (mask === null || mask.complete) {
 
 iocard_back = """\
 {{#%(src_img)s}}
-<div id="io-header">{{%(header)s}}</div>
-<div id="io-wrapper">
-  <div id="io-overlay">{{%(ans)s}}</div>
-  <div id="io-original">{{%(src_img)s}}</div>
-</div>
-{{#%(footer)s}}<div id="io-footer">{{%(footer)s}}</div>{{/%(footer)s}}
-<button id="io-revl-btn" onclick="toggle();">Toggle Masks</button>
-<div id="io-extra-wrapper">
-  <div id="io-extra">
+<div class="notion-card card-image-occlusion">
+  <div class="title-header"><div class="title-label">{{%(title)s}}</div></div>
+  <div class="front-wrapper"><div class="question-content">{{%(header)s}}</div></div>
+  <div id="io-wrapper">
+    <div id="io-overlay">{{%(ans)s}}</div>
+    <div id="io-original">{{%(src_img)s}}</div>
+  </div>
+  {{#%(footer)s}}<div id="io-footer">{{%(footer)s}}</div>{{/%(footer)s}}
+  <button id="io-revl-btn" onclick="toggle();">Toggle Masks</button>
+  <div id="io-extra-wrapper">
+    <div id="io-extra">
     {{#%(remarks)s}}
       <div class="io-extra-entry">
         <div class="io-field-descr">%(remarks)s</div>{{%(remarks)s}}
@@ -106,6 +112,7 @@ iocard_back = """\
         <div class="io-field-descr">%(extratwo)s</div>{{%(extratwo)s}}
       </div>
     {{/%(extratwo)s}}
+    </div>
   </div>
 </div>
 
@@ -138,6 +145,7 @@ if (mask === null || mask.complete) {
     "ans": IO_FLDS["am"],
     "svg": IO_FLDS["om"],
     "src_img": IO_FLDS["im"],
+    "title": IO_FLDS["tl"],
     "header": IO_FLDS["hd"],
     "footer": IO_FLDS["ft"],
     "remarks": IO_FLDS["rk"],
@@ -149,11 +157,43 @@ if (mask === null || mask.complete) {
 iocard_css = """\
 /* GENERAL CARD STYLE */
 .card {
-  font-family: "Helvetica LT Std", Helvetica, Arial, Sans;
-  font-size: 150%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 18px;
+  text-align: left;
+  color: #f5f5f2;
+  background-color: #000;
+  line-height: 1.65;
+  padding: 0;
+  margin: 0;
+}
+
+.card-image-occlusion {
+  min-height: 100vh;
+  padding-bottom: 44px;
+  background: #000;
+}
+
+.title-header {
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid #2d2d2a;
+  color: #f5ce94;
+  background: #171716;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .14em;
   text-align: center;
-  color: black;
-  background-color: white;
+  text-transform: uppercase;
+}
+
+.front-wrapper {
+  width: min(calc(100% - 40px), 760px);
+  margin: 0 auto;
+  padding: 26px 0 22px;
+  color: #fff;
+  font-size: 22px;
+  font-weight: 650;
+  line-height: 1.45;
+  text-shadow: 0 1.5px 2px rgba(248, 106, 255, .567);
 }
 
 /* OCCLUSION CSS START - don't edit this */
@@ -174,7 +214,14 @@ iocard_css = """\
 
 #io-wrapper {
   position:relative;
+  width: min(calc(100% - 32px), 1100px);
+  margin: 0 auto;
+}
+
+#io-overlay img, #io-original img {
+  display: block;
   width: 100%;
+  height: auto;
 }
 /* OCCLUSION CSS END */
 

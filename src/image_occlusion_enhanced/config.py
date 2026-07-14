@@ -36,6 +36,7 @@ Sets up configuration, including constants
 
 # TODO: move constants to consts.py
 
+import copy
 import os
 import sys
 
@@ -49,7 +50,8 @@ IO_CARD_NAME = "IO Card"
 
 IO_FLDS = {
     "id": "ID (hidden)",
-    "hd": "Header",
+    "tl": "Title",
+    "hd": "Front",
     "im": "Image",
     "ft": "Footer",
     "rk": "Remarks",
@@ -61,7 +63,20 @@ IO_FLDS = {
     "om": "Original Mask",
 }
 
-IO_FLDS_IDS = ["id", "hd", "im", "qm", "ft", "rk", "sc", "e1", "e2", "am", "om"]
+IO_FLDS_IDS = [
+    "id",
+    "tl",
+    "hd",
+    "im",
+    "qm",
+    "ft",
+    "rk",
+    "sc",
+    "e1",
+    "e2",
+    "am",
+    "om",
+]
 
 # TODO: Use IDs instead of names to make these compatible with self.ioflds
 
@@ -78,9 +93,9 @@ IO_HOTKEY = "Ctrl+Shift+O"
 
 # default configurations
 # TODO: update version number before release
-default_conf_local = {"version": 1.25, "dir": IO_HOME, "hotkey": IO_HOTKEY}
+default_conf_local = {"version": 1.26, "dir": IO_HOME, "hotkey": IO_HOTKEY}
 default_conf_syncd = {
-    "version": 1.25,
+    "version": 1.26,
     "ofill": "FFEBA2",
     "qfill": "FF7E7E",
     "scol": "2D2D2D",
@@ -95,28 +110,47 @@ from . import template
 
 
 def getSyncedConfig():
-    # Synced preferences
-    if "imgocc" not in mw.col.conf:
-        # create initial configuration
-        mw.col.conf["imgocc"] = default_conf_syncd
+    """Load and migrate the collection-wide configuration"""
+    config = mw.col.conf.get("imgocc")
+    config_changed = False
+
+    if config is None:
+        # Eine eigene Kopie verhindert Änderungen an den Standardwerten
+        config = copy.deepcopy(default_conf_syncd)
+        config_changed = True
 
         # upgrade from IO 2.0:
         if "image_occlusion_conf" in mw.col.conf:
             old_conf = mw.col.conf["image_occlusion_conf"]
-            mw.col.conf["imgocc"]["ofill"] = old_conf["initFill[color]"]
-            mw.col.conf["imgocc"]["qfill"] = old_conf["mask_fill_color"]
+            config["ofill"] = old_conf["initFill[color]"]
+            config["qfill"] = old_conf["mask_fill_color"]
             # insert other upgrade actions here
-        mw.col.setMod()
 
-    elif mw.col.conf["imgocc"]["version"] < default_conf_syncd["version"]:
+    elif config.get("version", 0) < default_conf_syncd["version"]:
         print("Updating config DB from earlier IO release")
         for key in list(default_conf_syncd.keys()):
-            if key not in mw.col.conf["imgocc"]:
-                mw.col.conf["imgocc"][key] = default_conf_syncd[key]
-        mw.col.conf["imgocc"]["version"] = default_conf_syncd["version"]
+            if key not in config:
+                config[key] = copy.deepcopy(default_conf_syncd[key])
+        config["version"] = default_conf_syncd["version"]
+        config_changed = True
+
+    # Feldzuordnungen auch reparieren, wenn eine frühere Migration bereits
+    # die Versionsnummer gespeichert hat
+    configured_fields = config.setdefault("flds", {})
+    if configured_fields.get("hd") == "Header":
+        configured_fields["hd"] = IO_FLDS["hd"]
+        config_changed = True
+    for field_id, field_name in IO_FLDS.items():
+        if field_id not in configured_fields:
+            configured_fields[field_id] = field_name
+            config_changed = True
+
+    if config_changed:
+        # Moderne Anki-Versionen erfordern das Zurückschreiben des ganzen Objekts
+        mw.col.conf["imgocc"] = config
         mw.col.setMod()
 
-    return mw.col.conf["imgocc"]
+    return config
 
 
 def getLocalConfig():
@@ -137,11 +171,37 @@ def getOrCreateModel():
     if not model:
         # create model and set up default field name config
         model = template.add_io_model(mw.col)
-        mw.col.conf["imgocc"]["flds"] = default_conf_syncd["flds"]
+        config = mw.col.conf["imgocc"]
+        config["flds"] = copy.deepcopy(default_conf_syncd["flds"])
+        mw.col.conf["imgocc"] = config
         return model
+    model = ensure_custom_model_fields(model)
     model_version = mw.col.conf["imgocc"]["version"]
     if model_version < default_conf_syncd["version"]:
         return template.update_template(mw.col, model_version)
+    return model
+
+
+def ensure_custom_model_fields(model):
+    """Migrate the existing model without replacing notes or templates"""
+    models = mw.col.models
+    field_names = models.fieldNames(model)
+
+    if IO_FLDS["hd"] not in field_names and "Header" in field_names:
+        header_field = next(field for field in model["flds"] if field["name"] == "Header")
+        models.renameField(model, header_field, IO_FLDS["hd"])
+        field_names = models.fieldNames(model)
+
+    if IO_FLDS["tl"] not in field_names:
+        title_field = models.newField(IO_FLDS["tl"])
+        models.addField(model, title_field)
+
+    config = mw.col.conf["imgocc"]
+    configured_fields = config.setdefault("flds", {})
+    configured_fields["hd"] = IO_FLDS["hd"]
+    configured_fields["tl"] = IO_FLDS["tl"]
+    mw.col.conf["imgocc"] = config
+    mw.col.setMod()
     return model
 
 

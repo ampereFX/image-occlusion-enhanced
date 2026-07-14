@@ -244,7 +244,7 @@ class ImgOccAdd(object):
                 fn = i["name"]
                 if fn in self.ioflds_priv:
                     continue
-                dialog.tedit[fn].setPlainText(onote[fn].replace("<br />", "\n"))
+                dialog.setFieldText(fn, onote[fn].replace("<br />", "\n"))
             svg_url = path_to_url(opref["omask"])
             items.addQueryItem("url", svg_url)
         else:
@@ -257,9 +257,12 @@ class ImgOccAdd(object):
         dialog.tags_edit.setText(" ".join(opref["tags"]))
 
         if onote:
+            for field_name in [self.ioflds["tl"], self.ioflds["hd"]]:
+                if field_name in onote:
+                    dialog.setFieldText(field_name, onote[field_name])
             for i in self.ioflds_prsv:
                 if i in onote:
-                    dialog.tedit[i].setPlainText(onote[i])
+                    dialog.setFieldText(i, onote[i])
 
         if self.mode == "add":
             dialog.setModal(False)
@@ -335,6 +338,13 @@ class ImgOccAdd(object):
         if r1 is False:
             return False
         (fields, tags) = r1
+        creation_options, error = dialog.resolveCardCreationOptions(
+            fields.get(self.ioflds["tl"], "")
+        )
+        if error:
+            showWarning(error, parent=dialog)
+            return False
+        fields[self.ioflds["tl"]] = creation_options["title"]
         did = dialog.deckChooser.selected_deck_id
 
         noteGenerator = genByKey(choice)
@@ -345,6 +355,17 @@ class ImgOccAdd(object):
         if result is False:
             return False
         notes: list = result  # type: ignore
+
+        try:
+            dialog.applyCreatedNotesOptions(notes, creation_options)
+        except Exception as error:
+            showWarning(
+                _(
+                    "Cards were created, but their requested position could not be applied:"
+                    "<br><br>{error}"
+                ).format(error=error),
+                parent=dialog,
+            )
 
         if self.origin == "addcards":
             try:
@@ -453,7 +474,7 @@ class ImgOccAdd(object):
                 continue
             if edit and fn in self.sconf["skip"]:
                 continue
-            text = dialog.tedit[fn].toPlainText().replace("\n", "<br />")
+            text = dialog.fieldText(fn).replace("\n", "<br />")
             fields[fn] = text
         tags = dialog.tags_edit.text().split()
         return (fields, tags)

@@ -3527,31 +3527,54 @@ var getMouseTarget = this.getMouseTarget = function(evt) {
 	$(container).mousedown(mouseDown).mousemove(mouseMove).click(handleLinkInCanvas).dblclick(dblClick).mouseup(mouseUp);
 	//	$(window).mouseup(mouseUp);
 	
-	 //TODO(rafaelcastrocouto): User preference for shift key and zoom factor
-	$(container).bind("mousewheel DOMMouseScroll", function(e){
+	var workarea = container.parentNode;
+	var zoomAtViewportPoint = function(factor, clientX, clientY) {
+		var workareaRect = workarea.getBoundingClientRect();
+		if(clientX < workareaRect.left || clientX > workareaRect.right ||
+			clientY < workareaRect.top || clientY > workareaRect.bottom) {
+			return false;
+		}
 
-		if (!e.ctrlKey) {return;}
-		e.preventDefault();
-		var evt = e.originalEvent;
-
-
-		root_sctm = $('#svgcontent g')[0].getScreenCTM().inverse();
-		var pt = svgedit.math.transformPoint( evt.pageX, evt.pageY, root_sctm );
-
-		var bbox = {
+		var screenCtm = svgcontent.getScreenCTM();
+		if(!screenCtm) {return false;}
+		root_sctm = screenCtm.inverse();
+		var pt = svgedit.math.transformPoint(clientX, clientY, root_sctm);
+		call("zoomed", {
 			'x': pt.x,
 			'y': pt.y,
 			'width': 0,
-			'height': 0
-		};
+			'height': 0,
+			'factor': factor,
+			'viewportX': clientX - workareaRect.left,
+			'viewportY': clientY - workareaRect.top
+		});
+		return true;
+	};
 
-		var delta = (evt.wheelDelta) ? evt.wheelDelta : (evt.detail) ? -evt.detail : 0;
-		if (!delta) {return;}
+	window.ioNativeGestureZoom = function(magnificationDelta, clientX, clientY) {
+		return zoomAtViewportPoint(
+			svgeditWheelZoom.factorForNativeGesture(magnificationDelta),
+			clientX,
+			clientY
+		);
+	};
 
-		bbox.factor = Math.max(3/4, Math.min(4/3, (delta)));
-	
-		call("zoomed", bbox);
-	});
+	svgdoc.addEventListener("wheel", function(evt) {
+		if (!evt.ctrlKey) {return;}
+
+		// Chromium darf eine Pinch-Geste niemals zum Zoomen der Editoroberfläche nutzen
+		evt.preventDefault();
+		if (!workarea.contains(evt.target) || !evt.deltaY) {return;}
+
+		var pixelDelta = svgeditWheelZoom.deltaInPixels(
+			evt.deltaY, evt.deltaMode, container.clientHeight
+		);
+		zoomAtViewportPoint(
+			svgeditWheelZoom.factorForDelta(pixelDelta),
+			evt.clientX,
+			evt.clientY
+		);
+	}, {capture: true, passive: false});
 	
 }());
 

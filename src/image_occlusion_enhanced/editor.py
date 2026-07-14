@@ -43,6 +43,7 @@ from aqt.qt import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QEvent,
     QHBoxLayout,
     QIcon,
     QKeySequence,
@@ -53,7 +54,6 @@ from aqt.qt import (
     QShortcut,
     QSize,
     Qt,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
     sip,
@@ -79,6 +79,59 @@ class ImgOccWebView(webview.AnkiWebView):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self._domDone = False
+        self._native_zoom_anchor = None
+        self.setZoomFactor(1.0)
+        QApplication.instance().installEventFilter(self)
+
+    def _keep_editor_zoom_fixed(self, zoom_factor):
+        """Prevent Chromium from scaling the complete SVG editor interface"""
+        if zoom_factor != 1.0:
+            self.setZoomFactor(1.0)
+
+    def eventFilter(self, watched, event):
+        """Route native gestures from WebEngine's child widget to the SVG canvas."""
+        if event.type() != QEvent.Type.NativeGesture:
+            return super().eventFilter(watched, event)
+
+        target = watched
+        while target is not None and target is not self:
+            target = target.parent()
+        if target is not self:
+            return super().eventFilter(watched, event)
+
+        global_position = event.globalPosition().toPoint()
+        position = self.mapFromGlobal(global_position)
+
+        gesture_type = event.gestureType()
+        if gesture_type == Qt.NativeGestureType.BeginNativeGesture:
+            self._native_zoom_anchor = (position.x(), position.y())
+            event.accept()
+            return True
+
+        if gesture_type == Qt.NativeGestureType.ZoomNativeGesture:
+            if self._native_zoom_anchor is None:
+                self._native_zoom_anchor = (position.x(), position.y())
+            anchor_x, anchor_y = self._native_zoom_anchor
+            self.eval(
+                "window.ioNativeGestureZoom && "
+                f"window.ioNativeGestureZoom({float(event.value())!r}, "
+                f"{float(anchor_x)!r}, {float(anchor_y)!r});"
+            )
+            event.accept()
+            return True
+
+        if gesture_type == Qt.NativeGestureType.EndNativeGesture:
+            self._native_zoom_anchor = None
+            event.accept()
+            return True
+
+        if gesture_type == Qt.NativeGestureType.RotateNativeGesture:
+            # Pinch streams may interleave rotation events. Do not let Chromium
+            # reinterpret them as page-level navigation or scaling.
+            event.accept()
+            return True
+
+        return super().eventFilter(watched, event)
 
     def _onBridgeCmd(self, cmd):
         # ignore webchannel messages that arrive after underlying webview
@@ -130,6 +183,7 @@ class ImgOccEdit(QDialog):
         self.imgoccadd = imgoccadd
         self.parent = parent
         self.mode = "add"
+        self.card_creation_integration = None
         loadConfig(self)
         self.setupUi()
         restoreGeom(self, "imgoccedit")
@@ -193,6 +247,9 @@ class ImgOccEdit(QDialog):
         self.svg_edit = ImgOccWebView(parent=self)
         self.svg_edit._page = ImgOccWebPage(self.svg_edit._onBridgeCmd)
         self.svg_edit.setPage(self.svg_edit._page)
+        self.svg_edit._page.zoomFactorChanged.connect(
+            self.svg_edit._keep_editor_zoom_fixed
+        )
 
         self.svg_edit.escape_pressed.connect(self.reject)
 
@@ -312,9 +369,12 @@ class ImgOccEdit(QDialog):
         bottom_hbox.addWidget(self.occl_tp_select)
         bottom_hbox.addWidget(button_box)
 
-        # Tab 1
-        vbox1 = QVBoxLayout()
-        vbox1.setContentsMargins(0, 0, 0, 0)
+        editor_layout = QVBoxLayout()
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.primary_fields_layout = QVBoxLayout()
+        self.primary_fields_layout.setContentsMargins(10, 0, 10, 0)
+        editor_layout.addLayout(self.primary_fields_layout)
 
         svg_edit_loader = QLabel(_("Loading..."))
         svg_edit_loader.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -325,35 +385,35 @@ class ImgOccEdit(QDialog):
         self.svg_edit_loader = svg_edit_loader
         self.svg_edit_anim = anim
 
-        vbox1.addWidget(self.svg_edit, stretch=1)
-        vbox1.addWidget(self.svg_edit_loader, stretch=1)
+        editor_layout.addWidget(self.svg_edit, stretch=1)
+        editor_layout.addWidget(self.svg_edit_loader, stretch=1)
 
-        # Tab 2
-        # vbox2 fields are variable and added by setupFields() at a later point
+        self.position_layout = QVBoxLayout()
+        self.position_layout.setContentsMargins(10, 0, 10, 0)
+        editor_layout.addLayout(self.position_layout)
+
+        self.advanced_fields_button = QPushButton(_("More Fields"))
+        self.advanced_fields_button.setCheckable(True)
+        self.advanced_fields_button.setChecked(False)
+        self.advanced_fields_button.setAutoDefault(False)
+        editor_layout.addWidget(self.advanced_fields_button)
+
         self.vbox2 = QVBoxLayout()
-
-        # Main Tab Widget
-        tab1 = QWidget()
-        tab1.setContentsMargins(0, 0, 0, 0)
-        self.tab2 = QWidget()
-        tab1.setLayout(vbox1)
-        self.tab2.setLayout(self.vbox2)
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setContentsMargins(0, 0, 0, 0)
-        self.tab_widget.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.tab_widget.addTab(tab1, _("&Masks Editor"))
-        self.tab_widget.addTab(self.tab2, _("&Fields"))
-        self.tab_widget.setTabToolTip(1, _("Include additional information (optional)"))
-        self.tab_widget.setTabToolTip(0, _("Create image occlusion masks (required)"))
+        self.advanced_fields_widget = QWidget()
+        self.advanced_fields_widget.setLayout(self.vbox2)
+        self.advanced_fields_widget.hide()
+        self.advanced_fields_button.toggled.connect(
+            self.advanced_fields_widget.setVisible
+        )
+        editor_layout.addWidget(self.advanced_fields_widget)
 
         # Main Window
         vbox_main = QVBoxLayout()
         vbox_main.setContentsMargins(0, 5, 0, 5)
-        vbox_main.addWidget(self.tab_widget)
+        vbox_main.addLayout(editor_layout)
         vbox_main.addLayout(bottom_hbox)
         self.setLayout(vbox_main)
         self.setMinimumWidth(640)
-        self.tab_widget.setCurrentIndex(0)
         self.svg_edit.setFocus()
         self.showSvgEdit(False)
 
@@ -371,7 +431,6 @@ class ImgOccEdit(QDialog):
         QShortcut(QKeySequence("Ctrl+Shift+Return"), self).activated.connect(
             lambda: self.addOA(True)
         )
-        QShortcut(QKeySequence("Ctrl+Tab"), self).activated.connect(self.switchTabs)
         QShortcut(QKeySequence("Ctrl+r"), self).activated.connect(self.resetMainFields)
         QShortcut(QKeySequence("Ctrl+Shift+r"), self).activated.connect(
             self.resetAllFields
@@ -418,19 +477,21 @@ class ImgOccEdit(QDialog):
 
     def resetFields(self):
         """Reset all widgets. Needed for changes to the note type"""
-        layout = self.vbox2
-        for i in reversed(list(range(layout.count()))):
-            item = layout.takeAt(i)
-            layout.removeItem(item)
-            if item.widget():
-                item.widget().setParent(None)
-            elif item.layout():
-                sublayout = item.layout()
-                sublayout.setParent(None)
-                for i in reversed(list(range(sublayout.count()))):
-                    subitem = sublayout.takeAt(i)
-                    sublayout.removeItem(subitem)
-                    subitem.widget().setParent(None)
+        for layout in [
+            self.primary_fields_layout,
+            self.position_layout,
+            self.vbox2,
+        ]:
+            for index in reversed(range(layout.count())):
+                item = layout.takeAt(index)
+                if item.widget():
+                    item.widget().setParent(None)
+                elif item.layout():
+                    sublayout = item.layout()
+                    while sublayout.count():
+                        subitem = sublayout.takeAt(0)
+                        if subitem.widget():
+                            subitem.widget().setParent(None)
         self.tags_hbox.setParent(None)
 
     def setupFields(self, flds):
@@ -438,28 +499,84 @@ class ImgOccEdit(QDialog):
         self.tedit = {}
         self.tlabel = {}
         self.flds = flds
-        for i in flds:
-            if i["name"] in self.ioflds_priv:
-                continue
+
+        editable_fields = [
+            field for field in flds if field["name"] not in self.ioflds_priv
+        ]
+        primary_names = [self.ioflds["tl"], self.ioflds["hd"]]
+
+        def add_field(field, layout, minimum_height=40, maximum_height=None):
             hbox = QHBoxLayout()
             tedit = QPlainTextEdit()
-            label = QLabel(i["name"])
+            label = QLabel(field["name"])
             hbox.addWidget(label)
             hbox.addWidget(tedit)
             tedit.setTabChangesFocus(True)
-            tedit.setMinimumHeight(40)
+            tedit.setMinimumHeight(minimum_height)
+            if maximum_height is not None:
+                tedit.setMaximumHeight(maximum_height)
             label.setFixedWidth(70)
-            self.tedit[i["name"]] = tedit
-            self.tlabel[i["name"]] = label
-            self.vbox2.addLayout(hbox)
+            self.tedit[field["name"]] = tedit
+            self.tlabel[field["name"]] = label
+            layout.addLayout(hbox)
+
+        title_field = next(
+            field for field in editable_fields if field["name"] == primary_names[0]
+        )
+        front_field = next(
+            field for field in editable_fields if field["name"] == primary_names[1]
+        )
+        add_field(title_field, self.primary_fields_layout, 34, 34)
+
+        try:
+            import custom_shortcuts
+
+            custom_shortcuts.setup_card_creation_controls(
+                self,
+                self.primary_fields_layout,
+                initial_host=self.imgoccadd.ed.parentWindow,
+                position_layout=self.position_layout,
+            )
+            self.card_creation_integration = custom_shortcuts
+        except (ImportError, AttributeError):
+            self.card_creation_integration = None
+
+        add_field(front_field, self.primary_fields_layout, 54, 90)
+
+        for field in editable_fields:
+            if field["name"] in primary_names:
+                continue
+            add_field(field, self.vbox2)
 
         self.tags_hbox.addWidget(self.tags_label)
         self.tags_hbox.addWidget(self.tags_edit)
         self.vbox2.addLayout(self.tags_hbox)
         self.vbox2.addWidget(self.deck_container)
-        # switch Tab focus order of deckchooser and tags_edit (
-        # for some reason it's the wrong way around by default):
-        self.tab2.setTabOrder(self.tags_edit, self.deckChooser.deck)
+        self.setTabOrder(self.tags_edit, self.deckChooser.deck)
+
+    def setFieldText(self, field_name, text):
+        if field_name in self.tedit:
+            self.tedit[field_name].setPlainText(text)
+
+    def fieldText(self, field_name):
+        return self.tedit[field_name].toPlainText()
+
+    def resolveCardCreationOptions(self, typed_title):
+        if self.card_creation_integration is None:
+            return {
+                "title": typed_title.strip(),
+                "save_title": False,
+                "position_mode": "end",
+                "position": None,
+            }, None
+        return self.card_creation_integration.resolve_card_creation_options(
+            self, typed_title
+        )
+
+    def applyCreatedNotesOptions(self, notes, options):
+        if self.card_creation_integration is None:
+            return
+        self.card_creation_integration.apply_created_notes(self, notes, options)
 
     def switchToMode(self, mode):
         """Toggle between add and edit layouts"""
@@ -506,31 +623,22 @@ class ImgOccEdit(QDialog):
 
     # Other actions
 
-    def switchTabs(self):
-        currentTab = self.tab_widget.currentIndex()
-        if currentTab == 0:
-            self.tab_widget.setCurrentIndex(1)
-            if isinstance(QApplication.focusWidget(), QPushButton):
-                self.tedit[self.ioflds["hd"]].setFocus()
-        else:
-            self.tab_widget.setCurrentIndex(0)
-
     def focusField(self, idx):
         """Focus field in vbox2 layout by index number"""
-        self.tab_widget.setCurrentIndex(1)
-        target_item = self.vbox2.itemAt(idx)
-        if not target_item:
+        editable_fields = [
+            field
+            for field in self.flds
+            if field["name"] not in self.ioflds_priv
+        ]
+        if idx >= len(editable_fields):
             return
-        target_layout = target_item.layout()
-        target_widget = target_item.widget()
-        if target_layout:
-            target = target_layout.itemAt(1).widget()
-        elif target_widget:
-            target = target_widget
-        target.setFocus()
+        field_name = editable_fields[idx]["name"]
+        if field_name not in [self.ioflds["tl"], self.ioflds["hd"]]:
+            self.advanced_fields_button.setChecked(True)
+        self.tedit[field_name].setFocus()
 
     def focusTags(self):
-        self.tab_widget.setCurrentIndex(1)
+        self.advanced_fields_button.setChecked(True)
         self.tags_edit.setFocus()
 
     def resetMainFields(self):

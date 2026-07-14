@@ -79,13 +79,11 @@ def on_io_help():
 def on_image_occlusion_button(self, origin=None, image_path=None):
     """Launch Image Occlusion Enhanced"""
     origin = origin or get_editor_parent_instance(self.parentWindow)
+    synced_config = getSyncedConfig()
     io_model = getOrCreateModel()
     if io_model:
         io_model_fields = mw.col.models.fieldNames(io_model)
-        if "imgocc" in mw.col.conf:
-            dflt_fields = list(mw.col.conf["imgocc"]["flds"].values())
-        else:
-            dflt_fields = list(IO_FLDS.values())
+        dflt_fields = list(synced_config["flds"].values())
         # note type integrity check
         if not all(x in io_model_fields for x in dflt_fields):
             ioCritical("model_error", help="notetype", parent=self.parentWindow)
