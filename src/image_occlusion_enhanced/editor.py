@@ -54,9 +54,12 @@ from aqt.qt import (
     QPushButton,
     QShortcut,
     QSize,
+    QSizePolicy,
     QTabBar,
+    QTimer,
     Qt,
     QVBoxLayout,
+    QWIDGETSIZE_MAX,
     QWidget,
     sip,
     pyqtSignal,
@@ -64,6 +67,12 @@ from aqt.qt import (
 from aqt.utils import restoreGeom, saveGeom, askUser
 
 from .config import *
+from .compact_ui import (
+    ADD_BUTTON_LABELS,
+    TAB_LABELS,
+    TAB_NAMES,
+    bounded_default_editor_height,
+)
 from .consts import *
 from .dialogs import ioHelp
 from .lang import _
@@ -184,6 +193,16 @@ class ImgOccFieldEditor(Editor):
         # area, even if a user has based the note type on Anki's stock IO type.
         return False
 
+    def onBridgeCmd(self, cmd):
+        if cmd.startswith("imgoccEditorHeight:"):
+            try:
+                natural_height = int(cmd.split(":", 1)[1])
+            except ValueError:
+                return None
+            self.parentWindow.queueFieldEditorHeight(natural_height)
+            return None
+        return super().onBridgeCmd(cmd)
+
 
 class ImgOccEdit(QDialog):
     """Main Image Occlusion Editor dialog"""
@@ -202,6 +221,13 @@ class ImgOccEdit(QDialog):
         self._initial_input_state = None
         self._close_check_pending = False
         self._closing = False
+        # Give Anki's web editor enough room for its first render. Once loaded,
+        # the DOM observer replaces this bootstrap value with the natural size.
+        self._field_editor_natural_height = 120
+        self._svg_ready = False
+        self._field_height_timer = QTimer(self)
+        self._field_height_timer.setSingleShot(True)
+        self._field_height_timer.timeout.connect(self._applyQueuedFieldEditorHeight)
         loadConfig(self)
         self.setupUi()
         restoreGeom(self, "imgoccedit")
@@ -309,15 +335,16 @@ class ImgOccEdit(QDialog):
                     pass
 
         # Button row widgets
-        self.bottom_label = QLabel()
         button_box = QDialogButtonBox(Qt.Orientation.Horizontal, self)
         button_box.setCenterButtons(False)
 
-        image_btn = QPushButton(_("Change &Image"))
+        image_btn = QPushButton()
         image_btn.clicked.connect(self.changeImage)
         image_btn.setIcon(QIcon(os.path.join(ICONS_PATH, "add.png")))
         image_btn.setIconSize(QSize(16, 16))
         image_btn.setAutoDefault(False)
+        image_btn.setAccessibleName(_("Change Image"))
+        self.image_btn = image_btn
 
         self.occl_tp_select = QComboBox()
         self.occl_tp_select.addItem(_("Don't Change"), "Don't Change")
@@ -331,17 +358,15 @@ class ImgOccEdit(QDialog):
             _("&Add New Cards"), QDialogButtonBox.ButtonRole.ActionRole
         )
         self.ao_btn = button_box.addButton(
-            _("Hide &All, Guess One"), QDialogButtonBox.ButtonRole.ActionRole
+            _(ADD_BUTTON_LABELS[0]), QDialogButtonBox.ButtonRole.ActionRole
         )
         self.oa_btn = button_box.addButton(
-            _("Hide &One, Guess One"), QDialogButtonBox.ButtonRole.ActionRole
-        )
-        help_button = button_box.addButton(
-            _("&?"), QDialogButtonBox.ButtonRole.ActionRole
+            _(ADD_BUTTON_LABELS[1]), QDialogButtonBox.ButtonRole.ActionRole
         )
         close_button = button_box.addButton(
-            _("&Close"), QDialogButtonBox.ButtonRole.RejectRole
+            _(ADD_BUTTON_LABELS[2]), QDialogButtonBox.ButtonRole.RejectRole
         )
+        close_button.setAccessibleName(_("Close"))
 
         image_tt = _(
             "Switch to a different image while preserving all of the shapes and fields"
@@ -376,7 +401,6 @@ class ImgOccEdit(QDialog):
             self.new_btn,
             self.ao_btn,
             self.oa_btn,
-            help_button,
             close_button,
         ]:
             btn.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
@@ -389,7 +413,6 @@ class ImgOccEdit(QDialog):
         self.new_btn.clicked.connect(self.new)
         self.ao_btn.clicked.connect(self.addAO)
         self.oa_btn.clicked.connect(self.addOA)
-        help_button.clicked.connect(self.onHelp)
         close_button.clicked.connect(self.reject)
 
         # Set basic layout up
@@ -398,17 +421,19 @@ class ImgOccEdit(QDialog):
         bottom_hbox = QHBoxLayout()
         bottom_hbox.setContentsMargins(10, 0, 10, 10)
         bottom_hbox.addWidget(image_btn)
-        bottom_hbox.insertStretch(1, stretch=1)
-        bottom_hbox.addWidget(self.bottom_label)
+        self.position_layout = QHBoxLayout()
+        self.position_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_hbox.addLayout(self.position_layout, stretch=1)
         bottom_hbox.addWidget(self.occl_tp_select)
         bottom_hbox.addWidget(button_box)
 
         editor_layout = QVBoxLayout()
         editor_layout.setContentsMargins(0, 0, 0, 0)
+        self.editor_layout = editor_layout
 
         self.primary_fields_layout = QVBoxLayout()
         self.primary_fields_layout.setContentsMargins(10, 0, 10, 0)
-        editor_layout.addLayout(self.primary_fields_layout)
+        editor_layout.addLayout(self.primary_fields_layout, stretch=0)
 
         svg_edit_loader = QLabel(_("Loading..."))
         svg_edit_loader.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -421,10 +446,6 @@ class ImgOccEdit(QDialog):
 
         editor_layout.addWidget(self.svg_edit, stretch=1)
         editor_layout.addWidget(self.svg_edit_loader, stretch=1)
-
-        self.position_layout = QVBoxLayout()
-        self.position_layout.setContentsMargins(10, 0, 10, 0)
-        editor_layout.addLayout(self.position_layout)
 
         # Main Window
         vbox_main = QVBoxLayout()
@@ -534,12 +555,15 @@ class ImgOccEdit(QDialog):
         self._title_field_ord = self._field_ord_by_name[self._title_field_name]
         self._front_field_ord = self._field_ord_by_name[self._front_field_name]
         self._inline_title_active = False
+        self._initial_title_focus_pending = True
 
         self.field_tabs = QTabBar(self)
         self.field_tabs.setDocumentMode(True)
         self.field_tabs.setExpanding(False)
-        self.field_tabs.addTab(_("Default"))
-        self.field_tabs.addTab(_("Fields"))
+        self.field_tabs.setAccessibleName(_("Editor views"))
+        for label, name in zip(TAB_LABELS, TAB_NAMES):
+            index = self.field_tabs.addTab(label)
+            self.field_tabs.setTabToolTip(index, _(name))
         self.field_tabs.setCurrentIndex(0)
         self.field_tabs.currentChanged.connect(self._apply_field_tab)
 
@@ -555,6 +579,7 @@ class ImgOccEdit(QDialog):
                     inline_title_entry=True,
                     save_control="context_menu",
                     position_trailing_widget=self.field_tabs,
+                    position_style="compact",
                 )
                 self._inline_title_active = True
             except TypeError:
@@ -573,6 +598,9 @@ class ImgOccEdit(QDialog):
             self._add_standalone_tab_row()
 
         self.field_editor_container = QWidget(self)
+        self.field_editor_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.field_editor = ImgOccFieldEditor(
             mw,
             self.field_editor_container,
@@ -646,19 +674,31 @@ class ImgOccEdit(QDialog):
                 )
         self.deck_container.setVisible(not default_tab)
         if default_tab:
-            # One native field plus the toolbar needs a bounded surface, not a
-            # share of the dialog's stretch space.  Keeping this fixed makes
-            # the canvas receive every otherwise-unused pixel.
-            self.field_editor_container.setFixedHeight(170)
+            self.field_editor_container.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+            )
+            self.editor_layout.setStretch(0, 0)
+            self.editor_layout.setStretch(1, 1)
+            self.editor_layout.setStretch(2, 1)
+            self.queueFieldEditorHeight(self._field_editor_natural_height)
         else:
-            self.field_editor_container.setMaximumHeight(360)
-            self.field_editor_container.setMinimumHeight(220)
+            self._field_height_timer.stop()
+            self.field_editor_container.setMinimumHeight(0)
+            self.field_editor_container.setMaximumHeight(QWIDGETSIZE_MAX)
+            self.field_editor_container.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            )
+            self.editor_layout.setStretch(0, 1)
+            self.editor_layout.setStretch(1, 0)
+            self.editor_layout.setStretch(2, 0)
+        self._syncSvgVisibility()
 
         if self.field_editor is None or self.field_note is None:
             return
         visible = self._visible_field_ords(tab_index)
         show_tags = not default_tab
         expected_fields = len(self.field_note.fields)
+        view_name = json.dumps("default" if default_tab else "fields")
         script = f"""
 (function () {{
   const visible = new Set({json.dumps(visible)});
@@ -672,6 +712,15 @@ class ImgOccEdit(QDialog):
         if (attempt < 30) setTimeout(function () {{ apply(attempt + 1); }}, 20);
         return;
       }}
+      const toolbar = editor.toolbar && editor.toolbar.toolbar;
+      if (toolbar) {{
+        [
+          "notetype", "settings", "inlineFormatting", "blockFormatting",
+          "template", "cloze", "image-occlusion-button", "addons"
+        ].forEach(function (id) {{
+          try {{ toolbar.hide(id); }} catch (error) {{ /* older Anki */ }}
+        }});
+      }}
       await Promise.all(editor.fields.map(async function (field, index) {{
         const element = await field.element;
         if (!element) return;
@@ -680,6 +729,35 @@ class ImgOccEdit(QDialog):
       }}));
       const noteEditor = document.querySelector(".note-editor");
       if (!noteEditor) return;
+      let style = document.getElementById("imgocc-embedded-editor-style");
+      if (!style) {{
+        style = document.createElement("style");
+        style.id = "imgocc-embedded-editor-style";
+        style.textContent = `
+          html, body {{ margin: 0; overflow-x: hidden; }}
+          body.imgocc-embedded-editor .editor-toolbar {{ display: none !important; }}
+          body[data-imgocc-view="default"] {{ overflow-y: auto; }}
+          body[data-imgocc-view="default"] .note-editor {{ height: auto !important; }}
+          body[data-imgocc-view="default"] .fields {{
+            flex-grow: 0 !important;
+            overflow-y: visible !important;
+          }}
+          body[data-imgocc-view="default"] .scroll-area-relative {{
+            height: auto !important;
+            flex-grow: 0 !important;
+          }}
+          body[data-imgocc-view="default"] .scroll-area {{
+            position: relative !important;
+            height: auto !important;
+            overflow: visible !important;
+          }}
+          body[data-imgocc-view="fields"] {{ overflow: hidden; }}
+          body[data-imgocc-view="fields"] .note-editor {{ height: 100% !important; }}
+        `;
+        document.head.appendChild(style);
+      }}
+      document.body.classList.add("imgocc-embedded-editor");
+      document.body.dataset.imgoccView = {view_name};
       const tagLabel = noteEditor.querySelector(":scope > .collapse-label");
       const tagEditor = noteEditor.querySelector(".tag-editor");
       let tagBlock = tagEditor;
@@ -688,12 +766,56 @@ class ImgOccEdit(QDialog):
       }}
       if (tagLabel) tagLabel.style.display = showTags ? "" : "none";
       if (tagBlock) tagBlock.style.display = showTags ? "" : "none";
+
+      if (window.imgOccHeightObserver) window.imgOccHeightObserver.disconnect();
+      let framePending = false;
+      function reportHeight() {{
+        if (document.body.dataset.imgoccView !== "default" || framePending) return;
+        framePending = true;
+        requestAnimationFrame(function () {{
+          framePending = false;
+          const naturalHeight = Math.max(
+            1, noteEditor.scrollHeight, noteEditor.offsetHeight
+          );
+          pycmd("imgoccEditorHeight:" + Math.ceil(naturalHeight));
+        }});
+      }}
+      window.imgOccHeightObserver = new ResizeObserver(reportHeight);
+      window.imgOccHeightObserver.observe(noteEditor);
+      reportHeight();
     }});
   }}
   apply(0);
 }})();
 """
         self.field_editor.web.eval(script)
+
+    def queueFieldEditorHeight(self, natural_height):
+        self._field_editor_natural_height = max(1, int(natural_height))
+        if (
+            hasattr(self, "field_tabs")
+            and self.field_tabs.currentIndex() == 0
+            and hasattr(self, "field_editor_container")
+        ):
+            self._field_height_timer.start(16)
+
+    def _applyQueuedFieldEditorHeight(self):
+        if (
+            not hasattr(self, "field_tabs")
+            or self.field_tabs.currentIndex() != 0
+            or not hasattr(self, "field_editor_container")
+        ):
+            return
+        height = bounded_default_editor_height(
+            self._field_editor_natural_height, self.height()
+        )
+        self.field_editor_container.setMinimumHeight(height)
+        self.field_editor_container.setMaximumHeight(height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "field_editor_container"):
+            self.queueFieldEditorHeight(self._field_editor_natural_height)
 
     def _reload_field_editor(self):
         if self.field_editor is None or self.field_note is None:
@@ -762,7 +884,6 @@ class ImgOccEdit(QDialog):
                 i.show()
             dl_txt = _("Deck")
             ttl = _("Image Occlusion Enhanced - Add Mode")
-            bl_txt = _("Add Cards:")
         else:
             for i in hide_on_add:
                 i.show()
@@ -770,22 +891,44 @@ class ImgOccEdit(QDialog):
                 i.hide()
             dl_txt = _("Deck for <i>Add new cards</i>")
             ttl = _("Image Occlusion Enhanced - Editing Mode")
-            bl_txt = _("Type:")
         self.deckChooser.deckLabel.setText(dl_txt)
         self.setWindowTitle(ttl)
-        self.bottom_label.setText(bl_txt)
         if hasattr(self, "field_tabs"):
             self._apply_field_tab(self.field_tabs.currentIndex())
 
     def showSvgEdit(self, state):
-        if not state:
-            self.svg_edit.hide()
-            self.svg_edit_anim.start()
-            self.svg_edit_loader.show()
-        else:
+        self._svg_ready = bool(state)
+        if state:
             self.svg_edit_anim.stop()
-            self.svg_edit_loader.hide()
-            self.svg_edit.show()
+        else:
+            self.svg_edit_anim.start()
+        self._syncSvgVisibility()
+        if (
+            state
+            and getattr(self, "_initial_title_focus_pending", False)
+            and self._inline_title_active
+            and self.field_tabs.currentIndex() == 0
+        ):
+            # Chromium takes focus as its page finishes loading. Reassert the
+            # logical first input once, after that load, so keyboard users can
+            # immediately type or press F2 to edit the selected title row.
+            self._initial_title_focus_pending = False
+            mw.progress.single_shot(
+                0,
+                lambda: self.saved_titles_list.setFocus(
+                    Qt.FocusReason.OtherFocusReason
+                ),
+            )
+
+    def _syncSvgVisibility(self):
+        if self.svg_edit is None:
+            return
+        default_tab = (
+            not hasattr(self, "field_tabs")
+            or self.field_tabs.currentIndex() == 0
+        )
+        self.svg_edit.setVisible(default_tab and self._svg_ready)
+        self.svg_edit_loader.setVisible(default_tab and not self._svg_ready)
 
     # Other actions
 
