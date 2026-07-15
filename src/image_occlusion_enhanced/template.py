@@ -38,32 +38,88 @@ from .config import *
 
 # DEFAULT CARD TEMPLATES
 
+io_stage_script = """\
+<script>
+(function () {
+  var wrapper = document.getElementById('io-wrapper');
+  var stage = document.getElementById('io-stage');
+  var original = document.querySelector('#io-original img');
+  var mask = document.querySelector('#io-overlay img');
+
+  if (!wrapper || !stage || !original) return;
+
+  function reservedHeightBelowWrapper() {
+    var height = 0;
+    var sibling = wrapper.nextElementSibling;
+    while (sibling && !sibling.classList.contains('io-extra-entry')) {
+      var style = window.getComputedStyle(sibling);
+      if (style.display !== 'none') {
+        height += sibling.getBoundingClientRect().height;
+        height += parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+      }
+      sibling = sibling.nextElementSibling;
+    }
+    return height;
+  }
+
+  function fitStage() {
+    var naturalWidth = original.naturalWidth;
+    var naturalHeight = original.naturalHeight;
+    if (!naturalWidth || !naturalHeight) return;
+
+    var viewportHeight = document.documentElement.clientHeight || window.innerHeight;
+    var wrapperStyle = window.getComputedStyle(wrapper);
+    var horizontalPadding = parseFloat(wrapperStyle.paddingLeft) + parseFloat(wrapperStyle.paddingRight);
+    var verticalPadding = parseFloat(wrapperStyle.paddingTop) + parseFloat(wrapperStyle.paddingBottom);
+    var availableWidth = wrapper.clientWidth - horizontalPadding;
+    var availableHeight = Math.max(
+      1,
+      viewportHeight
+        - wrapper.getBoundingClientRect().top
+        - verticalPadding
+        - reservedHeightBelowWrapper()
+    );
+    var scale = Math.min(1, availableWidth / naturalWidth, availableHeight / naturalHeight);
+
+    stage.style.width = (naturalWidth * scale) + 'px';
+    stage.style.height = (naturalHeight * scale) + 'px';
+    stage.classList.add('io-stage-ready');
+  }
+
+  function revealOriginal() {
+    document.getElementById('io-original').style.visibility = 'visible';
+  }
+
+  if (mask === null || mask.complete) revealOriginal();
+  else mask.addEventListener('load', revealOriginal, {once: true});
+
+  if (original.complete) fitStage();
+  else original.addEventListener('load', fitStage, {once: true});
+
+  window.addEventListener('resize', fitStage);
+  if (window.ResizeObserver) {
+    new ResizeObserver(fitStage).observe(wrapper);
+  }
+  requestAnimationFrame(function () { requestAnimationFrame(fitStage); });
+})();
+</script>\
+"""
+
 iocard_front = """\
+<!-- image-occlusion-enhanced-template-revision: 4 -->
 {{#%(src_img)s}}
 <div class="notion-card card-image-occlusion">
-  <div class="title-header"><div class="title-label">{{%(title)s}}</div></div>
-  <div class="front-wrapper"><div class="question-content">{{%(header)s}}</div></div>
+  <div class="title-header"><div class="content-frame"><div class="title-label">{{%(title)s}}</div></div></div>
+  <div class="front-wrapper"><div class="content-frame"><div class="question-content">{{%(header)s}}</div></div></div>
   <div id="io-wrapper">
-    <div id="io-overlay">{{%(que)s}}</div>
-    <div id="io-original">{{%(src_img)s}}</div>
+    <div id="io-stage">
+      <div id="io-original">{{%(src_img)s}}</div>
+      <div id="io-overlay">{{%(que)s}}</div>
+    </div>
   </div>
   {{#%(footer)s}}<div id="io-footer">{{%(footer)s}}</div>{{/%(footer)s}}
 </div>
-
-<script>
-// Prevent original image from loading before mask
-aFade = 50, qFade = 0;
-var mask = document.querySelector('#io-overlay>img');
-function loaded() {
-    var original = document.querySelector('#io-original');
-    original.style.visibility = "visible";
-}
-if (mask === null || mask.complete) {
-    loaded();
-} else {
-    mask.addEventListener('load', loaded);
-}
-</script>
+%(stage_script)s
 {{/%(src_img)s}}
 """ % {
     "que": IO_FLDS["qm"],
@@ -77,21 +133,23 @@ if (mask === null || mask.complete) {
     "sources": IO_FLDS["sc"],
     "extraone": IO_FLDS["e1"],
     "extratwo": IO_FLDS["e2"],
+    "stage_script": io_stage_script,
 }
 
 iocard_back = """\
+<!-- image-occlusion-enhanced-template-revision: 4 -->
 {{#%(src_img)s}}
 <div class="notion-card card-image-occlusion">
-  <div class="title-header"><div class="title-label">{{%(title)s}}</div></div>
-  <div class="front-wrapper"><div class="question-content">{{%(header)s}}</div></div>
+  <div class="title-header"><div class="content-frame"><div class="title-label">{{%(title)s}}</div></div></div>
+  <div class="front-wrapper"><div class="content-frame"><div class="question-content">{{%(header)s}}</div></div></div>
   <div id="io-wrapper">
-    <div id="io-overlay">{{%(ans)s}}</div>
-    <div id="io-original">{{%(src_img)s}}</div>
+    <div id="io-stage">
+      <div id="io-original">{{%(src_img)s}}</div>
+      <div id="io-overlay">{{%(ans)s}}</div>
+    </div>
   </div>
   {{#%(footer)s}}<div id="io-footer">{{%(footer)s}}</div>{{/%(footer)s}}
   <button id="io-revl-btn" onclick="toggle();">Toggle Masks</button>
-  <div id="io-extra-wrapper">
-    <div id="io-extra">
     {{#%(remarks)s}}
       <div class="io-extra-entry">
         <div class="io-field-descr">%(remarks)s</div>{{%(remarks)s}}
@@ -112,8 +170,6 @@ iocard_back = """\
         <div class="io-field-descr">%(extratwo)s</div>{{%(extratwo)s}}
       </div>
     {{/%(extratwo)s}}
-    </div>
-  </div>
 </div>
 
 <script>
@@ -126,19 +182,8 @@ var toggle = function() {
     amask.style.display = 'block'
 }
 
-// Prevent original image from loading before mask
-aFade = 50, qFade = 0;
-var mask = document.querySelector('#io-overlay>img');
-function loaded() {
-    var original = document.querySelector('#io-original');
-    original.style.visibility = "visible";
-}
-if (mask === null || mask.complete) {
-    loaded();
-} else {
-    mask.addEventListener('load', loaded);
-}
 </script>
+%(stage_script)s
 {{/%(src_img)s}}
 """ % {
     "que": IO_FLDS["qm"],
@@ -152,32 +197,71 @@ if (mask === null || mask.complete) {
     "sources": IO_FLDS["sc"],
     "extraone": IO_FLDS["e1"],
     "extratwo": IO_FLDS["e2"],
+    "stage_script": io_stage_script,
 }
 
 iocard_css = """\
+/* image-occlusion-enhanced-template-revision: 4 */
 /* GENERAL CARD STYLE */
+:root {
+  --bg-color: #000000;
+  --surface-color: #000000;
+  --text-color: #f5f5f2;
+  --title-color: #f5ce94;
+  --divider-color: #2d2d2a;
+  --secondary-bg: #171716;
+  --question-text-color: #ffffff;
+  --question-text-shadow: 0 1.5px 2px rgba(248, 106, 255, .567);
+  --content-width: 38ch;
+  --content-padding: 20px;
+}
+
 .card {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: 18px;
   text-align: left;
-  color: #f5f5f2;
-  background-color: #000;
+  color: var(--text-color);
+  background-color: var(--bg-color);
   line-height: 1.65;
   padding: 0;
   margin: 0;
 }
 
 .card-image-occlusion {
-  min-height: 100vh;
-  padding-bottom: 44px;
-  background: #000;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-height: 0;
+  background: var(--surface-color);
 }
 
 .title-header {
-  padding: 18px 20px 16px;
-  border-bottom: 1px solid #2d2d2a;
-  color: #f5ce94;
-  background: #171716;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 18px 0 16px;
+  border-bottom: 1px solid var(--divider-color);
+  background: var(--secondary-bg);
+}
+
+.content-frame {
+  box-sizing: border-box;
+  width: min(100%, calc(var(--content-width) + (var(--content-padding) * 2)));
+  margin: 0 auto;
+  padding-left: var(--content-padding);
+  padding-right: var(--content-padding);
+}
+
+.title-label {
+  position: static !important;
+  display: block;
+  width: 100%;
+  margin: 0;
+  color: var(--title-color);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: .14em;
@@ -186,42 +270,78 @@ iocard_css = """\
 }
 
 .front-wrapper {
-  width: min(calc(100% - 40px), 760px);
-  margin: 0 auto;
+  box-sizing: border-box;
+  width: 100%;
   padding: 26px 0 22px;
-  color: #fff;
+  color: var(--question-text-color);
+  text-shadow: var(--question-text-shadow);
+}
+
+.question-content {
+  width: 100%;
+  display: block;
   font-size: 22px;
   font-weight: 650;
+  letter-spacing: -.02em;
   line-height: 1.45;
-  text-shadow: 0 1.5px 2px rgba(248, 106, 255, .567);
+  overflow-wrap: anywhere;
 }
 
 /* OCCLUSION CSS START - don't edit this */
 #io-overlay {
-  position:absolute;
-  top:0;
-  width:100%;
-  z-index:3
+  position: absolute;
+  inset: 0;
+  z-index: 3;
 }
 
 #io-original {
-  position:relative;
-  top:0;
-  width:100%;
-  z-index:2;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
   visibility: hidden;
 }
 
 #io-wrapper {
-  position:relative;
-  width: min(calc(100% - 32px), 1100px);
-  margin: 0 auto;
+  box-sizing: border-box;
+  position: relative;
+  width: 100%;
+  padding: 0 var(--content-padding) var(--content-padding);
 }
 
-#io-overlay img, #io-original img {
-  display: block;
-  width: 100%;
-  height: auto;
+#io-stage {
+  position: relative;
+  max-width: 100%;
+  margin: 0 auto;
+  opacity: 0;
+}
+
+#io-stage.io-stage-ready {
+  opacity: 1;
+}
+
+#io-stage.io-stage-ready #io-overlay,
+#io-stage.io-stage-ready #io-original,
+#io-stage.io-stage-ready #io-overlay > *,
+#io-stage.io-stage-ready #io-original > *,
+#io-stage.io-stage-ready #io-overlay img,
+#io-stage.io-stage-ready #io-original img {
+  box-sizing: border-box !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  max-width: none !important;
+  height: 100% !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  transform: none !important;
+}
+
+#io-stage.io-stage-ready #io-overlay img,
+#io-stage.io-stage-ready #io-original img {
+  display: block !important;
+  object-fit: fill !important;
 }
 /* OCCLUSION CSS END */
 
@@ -231,32 +351,20 @@ iocard_css = """\
   margin-bottom: 0.2em;
 }
 
-#io-footer{
-  max-width: 80%;
-  margin-left: auto;
-  margin-right: auto;
-  margin-top: 0.8em;
+#io-footer,
+.io-extra-entry {
+  width: min(calc(100% - 40px), 760px);
+  margin: 20px auto 0;
+  color: #b7b7b0;
+}
+
+#io-footer {
   font-style: italic;
 }
 
-#io-extra-wrapper{
-  /* the wrapper is needed to center the
-  left-aligned blocks below it */
-  width: 80%;
-  margin-left: auto;
-  margin-right: auto;
-  margin-top: 0.5em;
-}
-
-#io-extra{
-  text-align:center;
-  display: inline-block;
-}
-
-.io-extra-entry{
-  margin-top: 0.8em;
+.io-extra-entry {
   font-size: 0.9em;
-  text-align:left;
+  text-align: left;
 }
 
 .io-field-descr{
@@ -266,7 +374,14 @@ iocard_css = """\
 }
 
 #io-revl-btn {
-  font-size: 0.5em;
+  display: block;
+  margin: 18px auto var(--content-padding);
+  padding: 7px 12px;
+  border: 1px solid var(--divider-color);
+  border-radius: 6px;
+  color: var(--text-color);
+  background: var(--secondary-bg);
+  font-size: 0.75em;
 }
 
 /* ADJUSTMENTS FOR MOBILE DEVICES */
@@ -274,10 +389,6 @@ iocard_css = """\
 .mobile .card, .mobile #content {
   font-size: 120%;
   margin: 0;
-}
-
-.mobile #io-extra-wrapper {
-  width: 95%;
 }
 
 .mobile #io-revl-btn {
@@ -347,7 +458,7 @@ def reset_template(col):
     template["qfmt"] = iocard_front
     template["afmt"] = iocard_back
     io_model["css"] = iocard_css
-    col.models.save()
+    col.models.save(io_model)
     return io_model
 
 

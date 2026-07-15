@@ -228,6 +228,8 @@ class ImgOccNoteGenerator(object):
         svg_node = mask_doc.documentElement
         cheight = float(svg_node.attributes["height"].value)
         cwidth = float(svg_node.attributes["width"].value)
+        svg_node.setAttribute("viewBox", "0 0 %s %s" % (cwidth, cheight))
+        svg_node.setAttribute("preserveAspectRatio", "none")
         carea = cheight * cwidth
         layer_nodes = self._layerNodesFrom(svg_node)
         mlayer_node = layer_nodes[-1]  # treat topmost layer as masks layer

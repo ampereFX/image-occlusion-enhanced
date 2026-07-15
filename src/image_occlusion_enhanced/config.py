@@ -90,12 +90,14 @@ IO_FIDS_PRSV = ["sc"]
 sys_encoding = sys.getfilesystemencoding()
 IO_HOME = os.path.expanduser("~")
 IO_HOTKEY = "Ctrl+Shift+O"
+IO_TEMPLATE_VERSION = 3
 
 # default configurations
 # TODO: update version number before release
 default_conf_local = {"version": 1.26, "dir": IO_HOME, "hotkey": IO_HOTKEY}
 default_conf_syncd = {
     "version": 1.26,
+    "template_version": IO_TEMPLATE_VERSION,
     "ofill": "FFEBA2",
     "qfill": "FF7E7E",
     "scol": "2D2D2D",
@@ -176,6 +178,18 @@ def getOrCreateModel():
         mw.col.conf["imgocc"] = config
         return model
     model = ensure_custom_model_fields(model)
+    config = mw.col.conf["imgocc"]
+    if config.get("template_version", 0) < template.IO_TEMPLATE_VERSION:
+        # Notion2Anki and users may deliberately manage a custom IO card
+        # template. Only migrate layouts that still use this add-on's
+        # characteristic io-wrapper structure.
+        question_format = model["tmpls"][0].get("qfmt", "")
+        if 'id="io-wrapper"' in question_format:
+            model = template.reset_template(mw.col)
+        config["template_version"] = template.IO_TEMPLATE_VERSION
+        mw.col.conf["imgocc"] = config
+        mw.col.setMod()
+        return model
     model_version = mw.col.conf["imgocc"]["version"]
     if model_version < default_conf_syncd["version"]:
         return template.update_template(mw.col, model_version)
