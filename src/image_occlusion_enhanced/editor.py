@@ -34,26 +34,28 @@
 Image Occlusion editor dialog
 """
 
+import json
 import os
 
 from anki.hooks import addHook, remHook
-from aqt import deckchooser, mw, tagedit, webview
+from aqt import deckchooser, mw, webview
+from aqt.editor import Editor, EditorMode
 from aqt.qt import (
     QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QEvent,
     QHBoxLayout,
     QIcon,
     QKeySequence,
     QLabel,
     QMovie,
-    QPlainTextEdit,
     QPushButton,
     QShortcut,
     QSize,
+    QTabBar,
     Qt,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
     sip,
@@ -79,6 +81,59 @@ class ImgOccWebView(webview.AnkiWebView):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
         self._domDone = False
+        self._native_zoom_anchor = None
+        self.setZoomFactor(1.0)
+        QApplication.instance().installEventFilter(self)
+
+    def _keep_editor_zoom_fixed(self, zoom_factor):
+        """Prevent Chromium from scaling the complete SVG editor interface"""
+        if zoom_factor != 1.0:
+            self.setZoomFactor(1.0)
+
+    def eventFilter(self, watched, event):
+        """Route native gestures from WebEngine's child widget to the SVG canvas."""
+        if event.type() != QEvent.Type.NativeGesture:
+            return super().eventFilter(watched, event)
+
+        target = watched
+        while target is not None and target is not self:
+            target = target.parent()
+        if target is not self:
+            return super().eventFilter(watched, event)
+
+        global_position = event.globalPosition().toPoint()
+        position = self.mapFromGlobal(global_position)
+
+        gesture_type = event.gestureType()
+        if gesture_type == Qt.NativeGestureType.BeginNativeGesture:
+            self._native_zoom_anchor = (position.x(), position.y())
+            event.accept()
+            return True
+
+        if gesture_type == Qt.NativeGestureType.ZoomNativeGesture:
+            if self._native_zoom_anchor is None:
+                self._native_zoom_anchor = (position.x(), position.y())
+            anchor_x, anchor_y = self._native_zoom_anchor
+            self.eval(
+                "window.ioNativeGestureZoom && "
+                f"window.ioNativeGestureZoom({float(event.value())!r}, "
+                f"{float(anchor_x)!r}, {float(anchor_y)!r});"
+            )
+            event.accept()
+            return True
+
+        if gesture_type == Qt.NativeGestureType.EndNativeGesture:
+            self._native_zoom_anchor = None
+            event.accept()
+            return True
+
+        if gesture_type == Qt.NativeGestureType.RotateNativeGesture:
+            # Pinch streams may interleave rotation events. Do not let Chromium
+            # reinterpret them as page-level navigation or scaling.
+            event.accept()
+            return True
+
+        return super().eventFilter(watched, event)
 
     def _onBridgeCmd(self, cmd):
         # ignore webchannel messages that arrive after underlying webview
@@ -119,6 +174,17 @@ class ImgOccWebView(webview.AnkiWebView):
         self.escape_pressed.emit()
 
 
+class ImgOccFieldEditor(Editor):
+    """Anki's real field editor, isolated from its built-in IO workflow."""
+
+    is_imgocc_embedded_editor = True
+
+    def current_notetype_is_image_occlusion(self):
+        # Image Occlusion Enhanced keeps its own SVG editor below this field
+        # area, even if a user has based the note type on Anki's stock IO type.
+        return False
+
+
 class ImgOccEdit(QDialog):
     """Main Image Occlusion Editor dialog"""
 
@@ -130,6 +196,12 @@ class ImgOccEdit(QDialog):
         self.imgoccadd = imgoccadd
         self.parent = parent
         self.mode = "add"
+        self.card_creation_integration = None
+        self.field_editor = None
+        self.field_note = None
+        self._initial_input_state = None
+        self._close_check_pending = False
+        self._closing = False
         loadConfig(self)
         self.setupUi()
         restoreGeom(self, "imgoccedit")
@@ -141,13 +213,24 @@ class ImgOccEdit(QDialog):
             addHook("unloadProfile", self.onProfileUnload)
 
     def closeEvent(self, event):
-        self._on_close()
+        if self._closing:
+            event.accept()
+            return
+        event.ignore()
+        self.reject()
 
     def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
         if mw.pm.profile is not None:
             self.deckChooser.cleanup()
             saveGeom(self, "imgoccedit")
         self.visible = False
+        if self.field_editor is not None:
+            self.field_editor.cleanup()
+            self.field_editor = None
+            self.field_note = None
         if hasattr(self.svg_edit, "cleanup"):  # 2.1.50+
             self.svg_edit.cleanup()  # type: ignore
         self.svg_edit = None
@@ -162,16 +245,28 @@ class ImgOccEdit(QDialog):
 
     def onProfileUnload(self):
         if not sip.isdeleted(self):
-            self.close()
+            self._on_close()
 
     def reject(self):
         if not self.svg_edit:
             return super().reject()
-        self.svg_edit.evalWithCallback(
-            "svgCanvas.undoMgr.getUndoStackSize() == 0", self._on_reject_callback
-        )
+        if self._close_check_pending:
+            return
+        self._close_check_pending = True
+
+        def check_svg_changes():
+            if not self.svg_edit:
+                self._close_check_pending = False
+                return
+            self.svg_edit.evalWithCallback(
+                "svgCanvas.undoMgr.getUndoStackSize() == 0",
+                self._on_reject_callback,
+            )
+
+        self.flushFieldEditor(check_svg_changes)
 
     def _on_reject_callback(self, undo_stack_empty: bool):
+        self._close_check_pending = False
         if (undo_stack_empty and not self._input_modified()) or askUser(
             "Are you sure you want to close the window? This will discard any unsaved"
             " changes.",
@@ -180,12 +275,9 @@ class ImgOccEdit(QDialog):
             self._on_close()
 
     def _input_modified(self) -> bool:
-        tags_modified = self.tags_edit.isModified()
-        fields_modified = any(
-            plain_text_edit.document().isModified()  # type: ignore
-            for plain_text_edit in self.findChildren(QPlainTextEdit)
-        )
-        return tags_modified or fields_modified
+        if self.field_note is None or self._initial_input_state is None:
+            return False
+        return self._current_input_state() != self._initial_input_state
 
     def setupUi(self):
         """Set up ImgOccEdit UI"""
@@ -193,13 +285,12 @@ class ImgOccEdit(QDialog):
         self.svg_edit = ImgOccWebView(parent=self)
         self.svg_edit._page = ImgOccWebPage(self.svg_edit._onBridgeCmd)
         self.svg_edit.setPage(self.svg_edit._page)
+        self.svg_edit._page.zoomFactorChanged.connect(
+            self.svg_edit._keep_editor_zoom_fixed
+        )
 
         self.svg_edit.escape_pressed.connect(self.reject)
 
-        self.tags_hbox = QHBoxLayout()
-        self.tags_edit = tagedit.TagEdit(self)
-        self.tags_label = QLabel(_("Tags"))
-        self.tags_label.setFixedWidth(70)
         self.deck_container = QWidget()
         self.deckChooser = deckchooser.DeckChooser(mw, self.deck_container, label=True)
         self.deckChooser.deck.setAutoDefault(False)
@@ -299,7 +390,7 @@ class ImgOccEdit(QDialog):
         self.ao_btn.clicked.connect(self.addAO)
         self.oa_btn.clicked.connect(self.addOA)
         help_button.clicked.connect(self.onHelp)
-        close_button.clicked.connect(self.close)
+        close_button.clicked.connect(self.reject)
 
         # Set basic layout up
 
@@ -312,9 +403,12 @@ class ImgOccEdit(QDialog):
         bottom_hbox.addWidget(self.occl_tp_select)
         bottom_hbox.addWidget(button_box)
 
-        # Tab 1
-        vbox1 = QVBoxLayout()
-        vbox1.setContentsMargins(0, 0, 0, 0)
+        editor_layout = QVBoxLayout()
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.primary_fields_layout = QVBoxLayout()
+        self.primary_fields_layout.setContentsMargins(10, 0, 10, 0)
+        editor_layout.addLayout(self.primary_fields_layout)
 
         svg_edit_loader = QLabel(_("Loading..."))
         svg_edit_loader.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -325,35 +419,20 @@ class ImgOccEdit(QDialog):
         self.svg_edit_loader = svg_edit_loader
         self.svg_edit_anim = anim
 
-        vbox1.addWidget(self.svg_edit, stretch=1)
-        vbox1.addWidget(self.svg_edit_loader, stretch=1)
+        editor_layout.addWidget(self.svg_edit, stretch=1)
+        editor_layout.addWidget(self.svg_edit_loader, stretch=1)
 
-        # Tab 2
-        # vbox2 fields are variable and added by setupFields() at a later point
-        self.vbox2 = QVBoxLayout()
-
-        # Main Tab Widget
-        tab1 = QWidget()
-        tab1.setContentsMargins(0, 0, 0, 0)
-        self.tab2 = QWidget()
-        tab1.setLayout(vbox1)
-        self.tab2.setLayout(self.vbox2)
-        self.tab_widget = QTabWidget()
-        self.tab_widget.setContentsMargins(0, 0, 0, 0)
-        self.tab_widget.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.tab_widget.addTab(tab1, _("&Masks Editor"))
-        self.tab_widget.addTab(self.tab2, _("&Fields"))
-        self.tab_widget.setTabToolTip(1, _("Include additional information (optional)"))
-        self.tab_widget.setTabToolTip(0, _("Create image occlusion masks (required)"))
+        self.position_layout = QVBoxLayout()
+        self.position_layout.setContentsMargins(10, 0, 10, 0)
+        editor_layout.addLayout(self.position_layout)
 
         # Main Window
         vbox_main = QVBoxLayout()
         vbox_main.setContentsMargins(0, 5, 0, 5)
-        vbox_main.addWidget(self.tab_widget)
+        vbox_main.addLayout(editor_layout)
         vbox_main.addLayout(bottom_hbox)
         self.setLayout(vbox_main)
         self.setMinimumWidth(640)
-        self.tab_widget.setCurrentIndex(0)
         self.svg_edit.setFocus()
         self.showSvgEdit(False)
 
@@ -371,7 +450,6 @@ class ImgOccEdit(QDialog):
         QShortcut(QKeySequence("Ctrl+Shift+Return"), self).activated.connect(
             lambda: self.addOA(True)
         )
-        QShortcut(QKeySequence("Ctrl+Tab"), self).activated.connect(self.switchTabs)
         QShortcut(QKeySequence("Ctrl+r"), self).activated.connect(self.resetMainFields)
         QShortcut(QKeySequence("Ctrl+Shift+r"), self).activated.connect(
             self.resetAllFields
@@ -395,18 +473,26 @@ class ImgOccEdit(QDialog):
             self.editNote()
 
     def addAO(self, close=False):
-        self.imgoccadd.onAddNotesButton("ao", close)
+        self.flushFieldEditor(
+            lambda: self.imgoccadd.onAddNotesButton("ao", close)
+        )
 
     def addOA(self, close=False):
-        self.imgoccadd.onAddNotesButton("oa", close)
+        self.flushFieldEditor(
+            lambda: self.imgoccadd.onAddNotesButton("oa", close)
+        )
 
     def new(self, close=False):
         choice = self.occl_tp_select.currentData()
-        self.imgoccadd.onAddNotesButton(choice, close)
+        self.flushFieldEditor(
+            lambda: self.imgoccadd.onAddNotesButton(choice, close)
+        )
 
     def editNote(self):
         choice = self.occl_tp_select.currentData()
-        self.imgoccadd.onEditNotesButton(choice)
+        self.flushFieldEditor(
+            lambda: self.imgoccadd.onEditNotesButton(choice)
+        )
 
     def onHelp(self):
         if self.mode == "add":
@@ -418,58 +504,257 @@ class ImgOccEdit(QDialog):
 
     def resetFields(self):
         """Reset all widgets. Needed for changes to the note type"""
-        layout = self.vbox2
-        for i in reversed(list(range(layout.count()))):
-            item = layout.takeAt(i)
-            layout.removeItem(item)
-            if item.widget():
-                item.widget().setParent(None)
-            elif item.layout():
-                sublayout = item.layout()
-                sublayout.setParent(None)
-                for i in reversed(list(range(sublayout.count()))):
-                    subitem = sublayout.takeAt(i)
-                    sublayout.removeItem(subitem)
-                    subitem.widget().setParent(None)
-        self.tags_hbox.setParent(None)
+        if self.field_editor is not None:
+            self.field_editor.cleanup()
+            self.field_editor = None
+        self.field_note = None
+        for layout in [self.primary_fields_layout, self.position_layout]:
+            for index in reversed(range(layout.count())):
+                item = layout.takeAt(index)
+                if item.widget():
+                    item.widget().setParent(None)
+                elif item.layout():
+                    sublayout = item.layout()
+                    while sublayout.count():
+                        subitem = sublayout.takeAt(0)
+                        if subitem.widget():
+                            subitem.widget().setParent(None)
+        self.card_creation_integration = None
+        self._initial_input_state = None
 
     def setupFields(self, flds):
-        """Setup dialog text edits based on note type fields"""
-        self.tedit = {}
-        self.tlabel = {}
+        """Set up Anki's native HTML field editor around a temporary note."""
         self.flds = flds
-        for i in flds:
-            if i["name"] in self.ioflds_priv:
-                continue
-            hbox = QHBoxLayout()
-            tedit = QPlainTextEdit()
-            label = QLabel(i["name"])
-            hbox.addWidget(label)
-            hbox.addWidget(tedit)
-            tedit.setTabChangesFocus(True)
-            tedit.setMinimumHeight(40)
-            label.setFixedWidth(70)
-            self.tedit[i["name"]] = tedit
-            self.tlabel[i["name"]] = label
-            self.vbox2.addLayout(hbox)
+        self.field_note = mw.col.new_note(self.model)
+        self._field_ord_by_name = {
+            field["name"]: index for index, field in enumerate(flds)
+        }
+        self._title_field_name = self.ioflds["tl"]
+        self._front_field_name = self.ioflds["hd"]
+        self._title_field_ord = self._field_ord_by_name[self._title_field_name]
+        self._front_field_ord = self._field_ord_by_name[self._front_field_name]
+        self._inline_title_active = False
 
-        self.tags_hbox.addWidget(self.tags_label)
-        self.tags_hbox.addWidget(self.tags_edit)
-        self.vbox2.addLayout(self.tags_hbox)
-        self.vbox2.addWidget(self.deck_container)
-        # switch Tab focus order of deckchooser and tags_edit (
-        # for some reason it's the wrong way around by default):
-        self.tab2.setTabOrder(self.tags_edit, self.deckChooser.deck)
+        self.field_tabs = QTabBar(self)
+        self.field_tabs.setDocumentMode(True)
+        self.field_tabs.setExpanding(False)
+        self.field_tabs.addTab(_("Default"))
+        self.field_tabs.addTab(_("Fields"))
+        self.field_tabs.setCurrentIndex(0)
+        self.field_tabs.currentChanged.connect(self._apply_field_tab)
+
+        try:
+            import custom_shortcuts
+
+            try:
+                custom_shortcuts.setup_card_creation_controls(
+                    self,
+                    self.primary_fields_layout,
+                    initial_host=self.imgoccadd.ed.parentWindow,
+                    position_layout=self.position_layout,
+                    inline_title_entry=True,
+                    save_control="context_menu",
+                    position_trailing_widget=self.field_tabs,
+                )
+                self._inline_title_active = True
+            except TypeError:
+                # Older custom_shortcuts releases remain usable. In that case
+                # the native Title field stays visible as the safe fallback.
+                custom_shortcuts.setup_card_creation_controls(
+                    self,
+                    self.primary_fields_layout,
+                    initial_host=self.imgoccadd.ed.parentWindow,
+                    position_layout=self.position_layout,
+                )
+                self._add_standalone_tab_row()
+            self.card_creation_integration = custom_shortcuts
+        except (ImportError, AttributeError):
+            self.card_creation_integration = None
+            self._add_standalone_tab_row()
+
+        self.field_editor_container = QWidget(self)
+        self.field_editor = ImgOccFieldEditor(
+            mw,
+            self.field_editor_container,
+            self,
+            editor_mode=EditorMode.ADD_CARDS,
+        )
+        self.primary_fields_layout.addWidget(self.field_editor_container)
+        self.primary_fields_layout.addWidget(self.deck_container)
+        self.deck_container.hide()
+
+        # callImgOccEdit() fills initial values immediately after setupFields().
+        # Deferring the first load coalesces them into one native editor render.
+        mw.progress.single_shot(0, self._finalize_field_setup)
+
+    def _add_standalone_tab_row(self):
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(self.field_tabs)
+        self.position_layout.addLayout(row)
+
+    def _finalize_field_setup(self):
+        if self.field_editor is None or self.field_note is None:
+            return
+        self.field_editor.set_note(self.field_note)
+        self._initial_input_state = self._current_input_state()
+        self._apply_field_tab(self.field_tabs.currentIndex())
+        if self._inline_title_active:
+            # Title is the first logical input in Default mode.  Restoring
+            # focus after the asynchronous native-editor load also gives
+            # keyboard users a predictable F2/type-to-edit entry point.
+            self.saved_titles_list.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _current_input_state(self):
+        if self.field_note is None:
+            return None
+        fields = list(self.field_note.fields)
+        if self._inline_title_active:
+            fields[self._title_field_ord] = self.fieldText(self._title_field_name)
+        return (tuple(fields), tuple(self.field_note.tags))
+
+    def _visible_field_ords(self, tab_index):
+        if tab_index == 0:
+            ords = [self._front_field_ord]
+            if not self._inline_title_active:
+                ords.insert(0, self._title_field_ord)
+            return ords
+
+        excluded = set(self.ioflds_priv)
+        excluded.update((self._title_field_name, self._front_field_name))
+        if self.mode != "add":
+            excluded.update(self.sconf["skip"])
+        return [
+            index
+            for index, field in enumerate(self.flds)
+            if field["name"] not in excluded
+        ]
+
+    def _apply_field_tab(self, tab_index):
+        if not hasattr(self, "field_editor_container"):
+            return
+        default_tab = tab_index == 0
+        title_container = getattr(self, "saved_titles_container", None)
+        if title_container is not None:
+            title_container.setVisible(default_tab)
+            if default_tab and self._inline_title_active:
+                mw.progress.single_shot(
+                    0,
+                    lambda: self.saved_titles_list.setFocus(
+                        Qt.FocusReason.OtherFocusReason
+                    ),
+                )
+        self.deck_container.setVisible(not default_tab)
+        if default_tab:
+            # One native field plus the toolbar needs a bounded surface, not a
+            # share of the dialog's stretch space.  Keeping this fixed makes
+            # the canvas receive every otherwise-unused pixel.
+            self.field_editor_container.setFixedHeight(170)
+        else:
+            self.field_editor_container.setMaximumHeight(360)
+            self.field_editor_container.setMinimumHeight(220)
+
+        if self.field_editor is None or self.field_note is None:
+            return
+        visible = self._visible_field_ords(tab_index)
+        show_tags = not default_tab
+        expected_fields = len(self.field_note.fields)
+        script = f"""
+(function () {{
+  const visible = new Set({json.dumps(visible)});
+  const showTags = {json.dumps(show_tags)};
+  const expectedFields = {expected_fields};
+  function apply(attempt) {{
+    require("anki/ui").loaded.then(async function () {{
+      const editors = require("anki/NoteEditor").instances;
+      const editor = editors && editors[0];
+      if (!editor || editor.fields.length < expectedFields) {{
+        if (attempt < 30) setTimeout(function () {{ apply(attempt + 1); }}, 20);
+        return;
+      }}
+      await Promise.all(editor.fields.map(async function (field, index) {{
+        const element = await field.element;
+        if (!element) return;
+        const container = element.closest(".field-container");
+        if (container) container.style.display = visible.has(index) ? "" : "none";
+      }}));
+      const noteEditor = document.querySelector(".note-editor");
+      if (!noteEditor) return;
+      const tagLabel = noteEditor.querySelector(":scope > .collapse-label");
+      const tagEditor = noteEditor.querySelector(".tag-editor");
+      let tagBlock = tagEditor;
+      while (tagBlock && tagBlock.parentElement !== noteEditor) {{
+        tagBlock = tagBlock.parentElement;
+      }}
+      if (tagLabel) tagLabel.style.display = showTags ? "" : "none";
+      if (tagBlock) tagBlock.style.display = showTags ? "" : "none";
+    }});
+  }}
+  apply(0);
+}})();
+"""
+        self.field_editor.web.eval(script)
+
+    def _reload_field_editor(self):
+        if self.field_editor is None or self.field_note is None:
+            return
+        self.field_editor.set_note(self.field_note)
+        self._apply_field_tab(self.field_tabs.currentIndex())
+
+    def setFieldText(self, field_name, text):
+        if self.field_note is None or field_name not in self.field_note:
+            return
+        self.field_note[field_name] = text
+        if field_name == self._title_field_name and self._inline_title_active:
+            self.card_creation_integration.set_inline_title(self, text)
+
+    def fieldText(self, field_name):
+        if self.field_note is None:
+            return ""
+        value = self.field_note[field_name]
+        if field_name == self._title_field_name and self._inline_title_active:
+            return self.card_creation_integration.selected_title_text(self, value)
+        return value
+
+    def on_inline_title_changed(self, title):
+        if self.field_note is not None:
+            self.field_note[self._title_field_name] = title
+
+    def setTags(self, tags):
+        if self.field_note is not None:
+            self.field_note.tags = list(tags)
+
+    def tags(self):
+        return list(self.field_note.tags) if self.field_note is not None else []
+
+    def flushFieldEditor(self, callback):
+        if self.field_editor is None:
+            callback()
+            return
+        self.field_editor.call_after_note_saved(callback, keepFocus=False)
+
+    def resolveCardCreationOptions(self, typed_title):
+        if self.card_creation_integration is None:
+            return {
+                "title": typed_title.strip(),
+                "save_title": False,
+                "position_mode": "end",
+                "position": None,
+            }, None
+        return self.card_creation_integration.resolve_card_creation_options(
+            self, typed_title
+        )
+
+    def applyCreatedNotesOptions(self, notes, options):
+        if self.card_creation_integration is None:
+            return
+        self.card_creation_integration.apply_created_notes(self, notes, options)
 
     def switchToMode(self, mode):
         """Toggle between add and edit layouts"""
         hide_on_add = [self.occl_tp_select, self.edit_btn, self.new_btn]
         hide_on_edit = [self.ao_btn, self.oa_btn]
         self.mode = mode
-        for i in list(self.tedit.values()):
-            i.show()
-        for i in list(self.tlabel.values()):
-            i.show()
         if mode == "add":
             for i in hide_on_add:
                 i.hide()
@@ -483,16 +768,14 @@ class ImgOccEdit(QDialog):
                 i.show()
             for i in hide_on_edit:
                 i.hide()
-            for i in self.sconf["skip"]:
-                if i in list(self.tedit.keys()):
-                    self.tedit[i].hide()
-                    self.tlabel[i].hide()
             dl_txt = _("Deck for <i>Add new cards</i>")
             ttl = _("Image Occlusion Enhanced - Editing Mode")
             bl_txt = _("Type:")
         self.deckChooser.deckLabel.setText(dl_txt)
         self.setWindowTitle(ttl)
         self.bottom_label.setText(bl_txt)
+        if hasattr(self, "field_tabs"):
+            self._apply_field_tab(self.field_tabs.currentIndex())
 
     def showSvgEdit(self, state):
         if not state:
@@ -506,46 +789,63 @@ class ImgOccEdit(QDialog):
 
     # Other actions
 
-    def switchTabs(self):
-        currentTab = self.tab_widget.currentIndex()
-        if currentTab == 0:
-            self.tab_widget.setCurrentIndex(1)
-            if isinstance(QApplication.focusWidget(), QPushButton):
-                self.tedit[self.ioflds["hd"]].setFocus()
-        else:
-            self.tab_widget.setCurrentIndex(0)
-
     def focusField(self, idx):
-        """Focus field in vbox2 layout by index number"""
-        self.tab_widget.setCurrentIndex(1)
-        target_item = self.vbox2.itemAt(idx)
-        if not target_item:
+        """Focus an editable native field, changing tabs when necessary."""
+        editable_fields = [
+            field
+            for field in self.flds
+            if field["name"] not in self.ioflds_priv
+        ]
+        if idx >= len(editable_fields):
             return
-        target_layout = target_item.layout()
-        target_widget = target_item.widget()
-        if target_layout:
-            target = target_layout.itemAt(1).widget()
-        elif target_widget:
-            target = target_widget
-        target.setFocus()
+        field_name = editable_fields[idx]["name"]
+        if field_name == self._title_field_name and self._inline_title_active:
+            self.field_tabs.setCurrentIndex(0)
+            special = self.saved_titles_list.item(0)
+            self.saved_titles_list.setCurrentItem(special)
+            self.saved_titles_list.editItem(special)
+            return
+        target_tab = 0 if field_name in (
+            self._title_field_name,
+            self._front_field_name,
+        ) else 1
+        self.field_tabs.setCurrentIndex(target_tab)
+        field_ord = self._field_ord_by_name[field_name]
+        mw.progress.single_shot(
+            0, lambda: self.field_editor.web.eval(f"focusField({field_ord});")
+        )
 
     def focusTags(self):
-        self.tab_widget.setCurrentIndex(1)
-        self.tags_edit.setFocus()
+        self.field_tabs.setCurrentIndex(1)
+        if self.field_editor is not None:
+            self.field_editor.web.eval(
+                "setTagsCollapsed(false); "
+                "setTimeout(function(){ "
+                "const input = document.querySelector('.tag-input input'); "
+                "if (input) input.focus(); }, 0);"
+            )
 
     def resetMainFields(self):
         """Reset all fields aside from sticky ones"""
+        if self.field_note is None:
+            return
         for i in self.flds:
             fn = i["name"]
             if fn in self.ioflds_priv or fn in self.ioflds_prsv:
                 continue
-            self.tedit[fn].setPlainText("")
+            self.field_note[fn] = ""
+        if self._inline_title_active:
+            self.card_creation_integration.set_inline_title(self, "")
+        self._reload_field_editor()
 
     def resetAllFields(self):
         """Reset all fields"""
         self.resetMainFields()
+        if self.field_note is None:
+            return
         for i in self.ioflds_prsv:
-            self.tedit[i].setPlainText("")
+            self.field_note[i] = ""
+        self._reload_field_editor()
 
     def fitImageCanvas(self, delay: int = 5):
         self.svg_edit.eval(

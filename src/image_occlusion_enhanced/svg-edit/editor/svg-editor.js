@@ -823,7 +823,12 @@
 				if(autoCenter) {
 					updateCanvas();
 				} else {
-					updateCanvas(false, {x: bb.x * zoomlevel + (bb.width * zoomlevel)/2, y: bb.y * zoomlevel + (bb.height * zoomlevel)/2});
+					updateCanvas(false, {
+						x: bb.x * zoomlevel + (bb.width * zoomlevel)/2,
+						y: bb.y * zoomlevel + (bb.height * zoomlevel)/2,
+						viewportX: bb.viewportX,
+						viewportY: bb.viewportY
+					});
 				}
 
 				if(svgCanvas.getMode() == 'zoom' && bb.width) {
@@ -4582,7 +4587,7 @@
 					};
 
 				} else {
-					new_ctr.x += offset.x,
+					new_ctr.x += offset.x;
 					new_ctr.y += offset.y;
 				}
 
@@ -4598,8 +4603,10 @@
 						w_area[0].scrollTop = scroll_y;
 					}
 				} else {
-					w_area[0].scrollLeft = new_ctr.x - w_orig/2;
-					w_area[0].scrollTop = new_ctr.y - h_orig/2;
+					var viewport_x = new_ctr.viewportX == null ? w_orig/2 : new_ctr.viewportX;
+					var viewport_y = new_ctr.viewportY == null ? h_orig/2 : new_ctr.viewportY;
+					w_area[0].scrollLeft = svgeditWheelZoom.scrollPositionForAnchor(new_ctr.x, viewport_x);
+					w_area[0].scrollTop = svgeditWheelZoom.scrollPositionForAnchor(new_ctr.y, viewport_y);
 				}
 				if(curConfig.showRulers) {
 					updateRulers(cnvs, zoom);

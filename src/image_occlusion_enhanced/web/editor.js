@@ -33,13 +33,23 @@ Any modifications to this file must keep this entire header intact.
 const NoteEditor = require("anki/NoteEditor");
 
 class ImageOcclusionEditorAdapter {
-  markIdField(index) {
+  markIdField(index, attempt = 0) {
     const idField = NoteEditor.instances[0].fields[index];
     if (!idField) {
       return;
     }
-    idField.element.then((element) => {
-      {
+    // Anki exposed this as a Promise in older releases and as the resolved
+    // element in newer editor builds.  Normalize both forms so embedding the
+    // native editor does not produce an unhandled TypeError.
+    const elementOrPromise = idField.element;
+    if (!elementOrPromise) {
+      if (attempt < 50) {
+        setTimeout(() => this.markIdField(index, attempt + 1), 20);
+      }
+      return;
+    }
+    Promise.resolve(elementOrPromise).then((element) => {
+      if (element) {
         element.classList.add("ionote-field-id");
       }
     });
